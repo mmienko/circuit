@@ -354,14 +354,14 @@ class CircuitBreakerTests extends CatsEffectSuite {
 
   test("should only count errors in a Window if windowing is enabled") {
     for {
-      circuitBreaker <- CircuitBreaker.default[IO](maxFailures = 2, resetTimeout = 10.seconds).withFailureWindow(500.millis).build
+      circuitBreaker <- CircuitBreaker.default[IO](maxFailures = 2, resetTimeout = 10.seconds).withFailureWindow(1.second).build
       action = circuitBreaker.protect(IO.raiseError(new RuntimeException("Boom!"))).attempt
-      _ <- action >> IO.sleep(500.millis) >> action >> IO.sleep(500.millis) >> action
+      _ <- action >> IO.sleep(1.second) >> action >> IO.sleep(1.second) >> action
       _ <- circuitBreaker.state.map {
         case _: CircuitBreaker.Closed => assert(true)
         case _ => assert(false)
       }
-      _ <- IO.sleep(500.millis) >> action >> IO.sleep(50.millis) >> action
+      _ <- IO.sleep(1.second) >> action >> IO.sleep(50.millis) >> action
       _ <- circuitBreaker.state.map {
         case _: CircuitBreaker.Open => assert(true)
         case _ => assert(false)
