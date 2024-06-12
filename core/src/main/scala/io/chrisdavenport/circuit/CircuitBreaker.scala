@@ -404,6 +404,14 @@ object CircuitBreaker {
       .withOnOpen(onOpen)
       .unsafe(ref)
 
+  /**
+   *
+   * @param maxFailures is the maximum count for failures before
+   *                    opening the circuit breaker
+   * @param resetTimeout is the timeout to wait in the `Open` state
+   *                     before attempting a close of the circuit breaker (but
+   *                     without the backoff function applied)
+   */
   def default[F[_]](
     maxFailures: Int,
     resetTimeout: FiniteDuration
@@ -464,28 +472,75 @@ object CircuitBreaker {
         exceptionFilter = exceptionFilter,
       )
 
+    /**
+     * @param maxFailures is the maximum count for failures before
+     *        opening the circuit breaker
+     */
     def withMaxFailures(maxFailures: Int): Builder[F] =
       copy(maxFailures = maxFailures)
+
+    /**
+      * @param failureWindow enables a window for failures to be counted.
+     *         If, for example, `maxFailures` is 10 and `failureWindow` is 1 minute,
+     *         then any error within the last minute will be counted, but errors
+     *         older than 1 minute will be discarded.
+     */
     def withFailureWindow(failureWindow: FiniteDuration): Builder[F] =
       copy(failureWindow = failureWindow)
+
+    /**
+     * @param resetTimeout is the timeout to wait in the `Open` state
+     *        before attempting a close of the circuit breaker (but
+     *        without the backoff function applied)
+     * @return
+     */
     def withResetTimeout(resetTimeout: FiniteDuration): Builder[F] =
       copy(resetTimeout = resetTimeout)
+
+    /**
+     * @param backoff is a function from FiniteDuration to FiniteDuration used
+     *        to determine the `resetTimeout` when in the `HalfOpen` state,
+     *        in case the attempt to `Close` fails. [[Backoff]] provides some
+     *        default implementations.
+     */
     def withBackOff(backoff: FiniteDuration => FiniteDuration): Builder[F] =
       copy(backoff = backoff)
+
+    /**
+     * @param maxResetTimeout is the maximum timeout the circuit breaker
+     *        is allowed to use when applying the `backoff`
+     */
     def withMaxResetTimout(maxResetTimeout: Duration): Builder[F] =
       copy(maxResetTimeout = maxResetTimeout)
     def withCancelableHalfOpen: Builder[F] =
       copy(cancelableHalfOpen = true)
     def withUncancelableHalfOpen: Builder[F] =
       copy(cancelableHalfOpen = false)
+
+    /**
+     * @param onRejected is for signaling rejected tasks
+     */
     def withOnRejected(onRejected: F[Unit]): Builder[F] =
       copy(onRejected = onRejected)
+
+    /**
+     * @param onClosed is for signaling a transition to `Closed`
+     */
     def withOnClosed(onClosed: F[Unit]): Builder[F] =
       copy(onClosed = onClosed)
+
+    /**
+     * @param onHalfOpen is for signaling a transition to `HalfOpen`
+     */
     def withOnHalfOpen(onHalfOpen: F[Unit]): Builder[F] =
       copy(onHalfOpen = onHalfOpen)
+
+    /**
+     * @param onOpen is for signaling a transition to `Open`
+     */
     def withOnOpen(onOpen: F[Unit]): Builder[F] =
       copy(onOpen = onOpen)
+
     /**
       * Adds a custom exception filter.
       *
@@ -569,6 +624,15 @@ object CircuitBreaker {
 
   sealed trait Reason
 
+  final case class Failure(timestamp: Timestamp, count: Int) {
+    def increment: Failure = copy(count = count + 1)
+  }
+
+  object Failure {
+    def at(timestamp: Timestamp): Failure = Failure(timestamp, count = 1)
+  }
+
+
   /** The initial [[State]] of the [[CircuitBreaker]]. While in this
    * state the circuit breaker allows tasks to be executed.
    *
@@ -578,19 +642,13 @@ object CircuitBreaker {
    *  - Successes reset the failure count to zero
    *  - When the `failures` counter reaches the `maxFailures` count,
    *    the breaker is tripped into the `Open` state
+   *  - If Windowing is enabled, i.e. windowSizeInMs > 0, then only
+   *    `failures` within the window period are counted.
    *
+   * @param events the failures in the window, None if not using window
+   * @param windowSizeInMs the size of window in milliseconds, 0 if disabled
    * @param failures is the current failures count
    */
-//  final case class Closed(failures: Int) extends State
-
-  final case class Failure(timestamp: Timestamp, count: Int) {
-    def increment: Failure = copy(count = count + 1)
-  }
-
-  object Failure {
-    def at(timestamp: Timestamp): Failure = Failure(timestamp, count = 1)
-  }
-
   final case class Closed private (events: Option[List[Failure]], windowSizeInMs: Long, failures: Int) extends State {
     def increment(timestamp: Timestamp): Closed =
       events match {
@@ -697,8 +755,6 @@ object CircuitBreaker {
    *    function)
    */
   case object HalfOpen extends State with Reason
-
-//  private val ClosedZero = Closed(0)
 
 
   /** Exception thrown whenever an execution attempt was rejected.
