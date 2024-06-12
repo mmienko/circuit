@@ -410,6 +410,7 @@ object CircuitBreaker {
   )(implicit F: Applicative[F]): Builder[F] =
     new Builder[F](
       maxFailures = maxFailures,
+      failureWindow = Duration.Zero,
       resetTimeout = resetTimeout,
       backoff = Backoff.exponential,
       maxResetTimeout = 1.minute,
@@ -423,6 +424,7 @@ object CircuitBreaker {
 
   final class Builder[F[_]] private[circuit] (
     private val maxFailures: Int,
+    private val failureWindow: FiniteDuration,
     private val resetTimeout: FiniteDuration,
     private val backoff: FiniteDuration => FiniteDuration,
     private val maxResetTimeout: Duration,
@@ -437,6 +439,7 @@ object CircuitBreaker {
 
     private def copy(
       maxFailures: Int = self.maxFailures,
+      failureWindow: FiniteDuration = self.failureWindow,
       resetTimeout: FiniteDuration = self.resetTimeout,
       backoff: FiniteDuration => FiniteDuration = self.backoff,
       maxResetTimeout: Duration = self.maxResetTimeout,
@@ -449,6 +452,7 @@ object CircuitBreaker {
     ): Builder[F] =
       new Builder[F](
         maxFailures = maxFailures,
+        failureWindow = failureWindow,
         resetTimeout = resetTimeout,
         backoff = backoff,
         maxResetTimeout = maxResetTimeout,
@@ -462,7 +466,9 @@ object CircuitBreaker {
 
     def withMaxFailures(maxFailures: Int): Builder[F] =
       copy(maxFailures = maxFailures)
-    def witResetTimeout(resetTimeout: FiniteDuration): Builder[F] =
+    def withFailureWindow(failureWindow: FiniteDuration): Builder[F] =
+      copy(failureWindow = failureWindow)
+    def withResetTimeout(resetTimeout: FiniteDuration): Builder[F] =
       copy(resetTimeout = resetTimeout)
     def withBackOff(backoff: FiniteDuration => FiniteDuration): Builder[F] =
       copy(backoff = backoff)
@@ -491,10 +497,11 @@ object CircuitBreaker {
       copy(exceptionFilter = exceptionFilter)
 
     def build(implicit F: Temporal[F]): F[CircuitBreaker[F]] =
-      Concurrent[F].ref[State](ClosedZero).map(ref =>
+      Concurrent[F].ref[State](Closed(failureWindow)).map(ref =>
         new SyncCircuitBreaker[F](
           ref,
           maxFailures,
+          failureWindow,
           resetTimeout,
           backoff,
           maxResetTimeout,
@@ -508,10 +515,11 @@ object CircuitBreaker {
       )
 
     def in[G[_]: Sync](implicit F: Async[F]): G[CircuitBreaker[F]] =
-      Ref.in[G, F, State](ClosedZero).map { ref =>
+      Ref.in[G, F, State](Closed(failureWindow)).map { ref =>
         new SyncCircuitBreaker[F](
           ref,
           maxFailures,
+          failureWindow,
           resetTimeout,
           backoff,
           maxResetTimeout,
@@ -528,6 +536,7 @@ object CircuitBreaker {
       new SyncCircuitBreaker[F](
         ref,
         maxFailures,
+        failureWindow,
         resetTimeout,
         backoff,
         maxResetTimeout,
@@ -572,7 +581,73 @@ object CircuitBreaker {
    *
    * @param failures is the current failures count
    */
-  final case class Closed(failures: Int) extends State
+//  final case class Closed(failures: Int) extends State
+
+  final case class Failure(timestamp: Timestamp, count: Int) {
+    def increment: Failure = copy(count = count + 1)
+  }
+
+  object Failure {
+    def at(timestamp: Timestamp): Failure = Failure(timestamp, count = 1)
+  }
+
+  final case class Closed private (events: Option[List[Failure]], windowSizeInMs: Long, failures: Int) extends State {
+    def increment(timestamp: Timestamp): Closed =
+      events match {
+        case None =>
+          Closed.noWindow(failures = failures + 1)
+
+        case Some(events) =>
+          val cutoff = timestamp - windowSizeInMs
+          val (validFailures, expiredFailures) = events.partition(_.timestamp >= cutoff)
+
+          validFailures.headOption match {
+            case Some(latestFailure) =>
+              // Slow, but simple. Tree would be a better structure for partition while preserving fast append. Note
+              // that tree should keep a count of all children node counts for total failure to be efficient.
+              val updatedFailures = failures - expiredFailures.map(_.count).sum + 1
+
+              if (latestFailure.timestamp == timestamp)
+                withWindow(
+                  events = latestFailure.increment :: validFailures.tail,
+                  updatedFailures
+                )
+              else
+                withWindow(
+                  events = Failure.at(timestamp) :: validFailures,
+                  updatedFailures
+                )
+
+            case None =>
+              withWindow(
+                events = List(Failure.at(timestamp)),
+                failures = 1
+              )
+          }
+      }
+
+    private def withWindow(events: List[Failure], failures: Int): Closed =
+      copy(events = events.some, failures = failures)
+
+  }
+
+  object Closed {
+    def apply(failureWindow: FiniteDuration): Closed =
+      if (failureWindow == Duration.Zero)
+        noWindow(failures = 0)
+      else
+        new Closed(
+          events = List.empty[Failure].some,
+          failureWindow.toMillis,
+          failures = 0
+        )
+
+    def noWindow(failures: Int): Closed = Closed(
+        events = none[List[Failure]],
+        windowSizeInMs = 0,
+        failures
+      )
+  }
 
   /** [[State]] of the [[CircuitBreaker]] in which the circuit
    * breaker rejects all tasks with a [[RejectedExecution]].
@@ -623,7 +698,7 @@ object CircuitBreaker {
    */
   case object HalfOpen extends State with Reason
 
-  private val ClosedZero = Closed(0)
+//  private val ClosedZero = Closed(0)
 
 
   /** Exception thrown whenever an execution attempt was rejected.
@@ -634,6 +709,7 @@ object CircuitBreaker {
   private final class SyncCircuitBreaker[F[_]] (
     ref: Ref[F, CircuitBreaker.State],
     maxFailures: Int,
+    failureWindow: FiniteDuration,
     resetTimeout: FiniteDuration,
     backoff: FiniteDuration => FiniteDuration,
     maxResetTimeout: Duration,
@@ -651,6 +727,7 @@ object CircuitBreaker {
     require(resetTimeout > Duration.Zero, "resetTimeout > 0")
     require(maxResetTimeout > Duration.Zero, "maxResetTimeout > 0")
 
+    private lazy val ClosedZero = Closed(failureWindow)
 
     def state: F[CircuitBreaker.State] = ref.get
 
@@ -659,6 +736,7 @@ object CircuitBreaker {
       new SyncCircuitBreaker(
         ref = ref,
         maxFailures = maxFailures,
+        failureWindow = failureWindow,
         resetTimeout = resetTimeout,
         backoff = backoff,
         maxResetTimeout = maxResetTimeout,
@@ -675,6 +753,7 @@ object CircuitBreaker {
       new SyncCircuitBreaker(
         ref = ref,
         maxFailures = maxFailures,
+        failureWindow = failureWindow,
         resetTimeout = resetTimeout,
         backoff = backoff,
         maxResetTimeout = maxResetTimeout,
@@ -691,6 +770,7 @@ object CircuitBreaker {
       new SyncCircuitBreaker(
         ref = ref,
         maxFailures = maxFailures,
+        failureWindow = failureWindow,
         resetTimeout = resetTimeout,
         backoff = backoff,
         maxResetTimeout = maxResetTimeout,
@@ -708,6 +788,7 @@ object CircuitBreaker {
       new SyncCircuitBreaker(
         ref = ref,
         maxFailures = maxFailures,
+        failureWindow = failureWindow,
         resetTimeout = resetTimeout,
         backoff = backoff,
         maxResetTimeout = maxResetTimeout,
@@ -724,19 +805,22 @@ object CircuitBreaker {
       poll(f).guaranteeCase {
         case Outcome.Succeeded(_) =>
           ref.modify{
-            case Closed(_) => (ClosedZero, F.unit)
+            case _: Closed => (ClosedZero, F.unit)
             case HalfOpen => (ClosedZero, onClosed.attempt.void)
             case Open(_,_) => (ClosedZero, onClosed.attempt.void)
           }.flatten
         case Outcome.Errored(e) =>
           Temporal[F].realTime.map(_.toMillis).flatMap { now =>
             ref.modify {
-              case Closed(failures) =>
+              case closed: Closed =>
                 if (exceptionFilter(e)) {
-                  val count = failures + 1
-                  if (count >= maxFailures) (Open(now, resetTimeout), onOpen.attempt.void)
-                  else (Closed(count), Applicative[F].unit)
-                } else (ClosedZero, Applicative[F].unit)
+                  val updated = closed.increment(now)
+                  if (updated.failures >= maxFailures)
+                    (Open(now, resetTimeout), onOpen.attempt.void)
+                  else
+                    (updated, Applicative[F].unit)
+                } else
+                  (ClosedZero, Applicative[F].unit)
               case open: Open => (open, Applicative[F].unit)
               case HalfOpen => (HalfOpen, Applicative[F].unit)
             }.flatten
@@ -810,6 +894,6 @@ object CircuitBreaker {
       override def doOnRejected(callback: F[Unit]): CircuitBreaker[F] = self
       override def doOnHalfOpen(callback: F[Unit]): CircuitBreaker[F] = self
       override def doOnClosed(callback: F[Unit]): CircuitBreaker[F] = self
-      override def state: F[CircuitBreaker.State] = F.pure(CircuitBreaker.Closed(0))
+      override def state: F[CircuitBreaker.State] = F.pure(CircuitBreaker.Closed.noWindow(0))
     }
 }

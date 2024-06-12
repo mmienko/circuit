@@ -160,10 +160,10 @@ class CircuitBreakerTests extends CatsEffectSuite {
       for {
         _ <- taskInError.attempt
         _ <- taskInError.attempt
-        _ <- circuitBreaker.state.map(assertEquals(_, CircuitBreaker.Closed(2)))
+        _ <- circuitBreaker.state.map(assertEquals(_, CircuitBreaker.Closed.noWindow(2)))
         // A successful value should reset the counter
         _ <- taskSuccess
-        _ <- circuitBreaker.state.map(assertEquals(_, CircuitBreaker.Closed(0)))
+        _ <- circuitBreaker.state.map(assertEquals(_, CircuitBreaker.Closed.noWindow(0)))
 
         _ <- taskInError.attempt.replicateA(5)
         _ <- circuitBreaker.state.map {
@@ -199,7 +199,7 @@ class CircuitBreakerTests extends CatsEffectSuite {
         _ <- fiber.join
 
         // Should re-open on success
-        _ <- circuitBreaker.state.map(assertEquals(_, CircuitBreaker.Closed(0)))
+        _ <- circuitBreaker.state.map(assertEquals(_, CircuitBreaker.Closed.noWindow(0)))
       } yield assertEquals( (openedCount, closedCount, halfOpenCount, rejectedCount), (1, 1, 1, 3))
 
     fa
@@ -220,7 +220,7 @@ class CircuitBreakerTests extends CatsEffectSuite {
     val fa =
       for {
         _ <- taskInError.attempt
-        _ <- circuitBreaker.state.map(assertEquals(_, CircuitBreaker.Closed(1)))
+        _ <- circuitBreaker.state.map(assertEquals(_, CircuitBreaker.Closed.noWindow(1)))
         _ <- taskInError.attempt
         _ <- circuitBreaker.state.map{
           case CircuitBreaker.Open(_, t) => assertEquals(t, 100.millis)
@@ -350,6 +350,24 @@ class CircuitBreakerTests extends CatsEffectSuite {
         case _ => assert(false)
       }
     } yield ()
+  }
+
+  test("should only count errors in a Window if windowing is enabled") {
+    for {
+      circuitBreaker <- CircuitBreaker.default[IO](maxFailures = 2, resetTimeout = 10.seconds).withFailureWindow(200.millis).build
+      action = circuitBreaker.protect(IO.raiseError(new RuntimeException("Boom!"))).attempt
+      _ <- action >> IO.sleep(200.millis) >> action >> IO.sleep(200.millis) >> action
+      _ <- circuitBreaker.state.map {
+        case _: CircuitBreaker.Closed => assert(true)
+        case _ => assert(false)
+      }
+      _ <- IO.sleep(200.millis) >> action >> IO.sleep(50.millis) >> action
+      _ <- circuitBreaker.state.map {
+        case _: CircuitBreaker.Open => assert(true)
+        case _ => assert(false)
+      }
+    } yield ()
+
   }
 
   test("Validate withUncancelableHalfOpen") {
