@@ -53,6 +53,8 @@ can be in any of these 3 states:
 
 - When the `failures` counter reaches the `maxFailures` count,the breaker is tripped into `Open` state
 
+- If Windowing is enabled, i.e. windowSizeInMs > 0, then only `failures` within the window period are counted.
+
 **Open**: The circuit breaker rejects all tasks with an RejectedExecution
 
 - all tasks fail fast with `RejectedExecution`
